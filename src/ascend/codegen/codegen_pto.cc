@@ -23,6 +23,7 @@
 #include <tvm/tirx/expr_functor.h>
 #include <tvm/tirx/op.h>
 #include <tvm/tirx/stmt_functor.h>
+#include <tvm/tirx/transform.h>
 
 #include <cmath>
 #include <cstdio>
@@ -2125,6 +2126,91 @@ bool CodeGenTileLangPTO::EmitSimdMergingCall_(const CallNode *op,
   return true;
 }
 
+// Frontend regions describe logical placement, not independent PTO physical
+// sections. Project the authored control flow once per core when it contains
+// multiple regions or sections nested in runtime control flow.
+class PTOMixedRegionProjector : public StmtMutator {
+public:
+  static PrimFunc Normalize(PrimFunc func) {
+    RegionCounter regions;
+    regions(func->body);
+    if (!regions.cube || !regions.vector ||
+        (regions.cube == 1 && regions.vector == 1 && !regions.nested))
+      return func;
+    Stmt cube_body = PTOMixedRegionProjector(false)(func->body);
+    Stmt vector_body = PTOMixedRegionProjector(true)(func->body);
+    Stmt body = SeqStmt({SBlock({}, {}, {}, "CUBE", cube_body),
+                         SBlock({}, {}, {}, "VECTOR", vector_body)});
+    // The two physical streams must not share local SSA definitions. Function
+    // parameters remain free variables and preserve their existing bindings.
+    func.CopyOnWrite()->body = ConvertSSA(body);
+    return func;
+  }
+
+private:
+  class RegionCounter : public StmtVisitor {
+  public:
+    int cube{0}, vector{0};
+    bool nested{false};
+
+  private:
+    void VisitStmt(const Stmt &stmt) final {
+      bool previous = in_control_;
+      in_control_ |= stmt.as<ForNode>() || stmt.as<WhileNode>() ||
+                     stmt.as<IfThenElseNode>();
+      StmtVisitor::VisitStmt(stmt);
+      in_control_ = previous;
+    }
+    void VisitStmt_(const SBlockNode *op) final {
+      if (op->name_hint == "CUBE" || op->name_hint == "VECTOR") {
+        cube += op->name_hint == "CUBE";
+        vector += op->name_hint == "VECTOR";
+        nested |= in_control_;
+        return;
+      }
+      StmtVisitor::VisitStmt_(op);
+    }
+    bool in_control_{false};
+  };
+
+  explicit PTOMixedRegionProjector(bool vector) : vector_(vector) {}
+
+  Stmt VisitStmt_(const AttrStmtNode *op) final {
+    const auto *iv = op->node.as<IterVarNode>();
+    if (op->attr_key != tirx::attr::thread_extent || !iv)
+      return StmtMutator::VisitStmt_(op);
+    // ConvertSSA does not freshen thread IterVars. Each projected stream must
+    // have independent launch/VF bindings as well as ordinary SSA variables.
+    Var var(iv->var->name_hint, iv->var.dtype());
+    Stmt body = VisitStmt(Substitute(op->body, {{iv->var, var}}));
+    IterVar thread(iv->dom, var, iv->iter_type, iv->thread_tag);
+    return AttrStmt(thread, op->attr_key, op->value, body, op->span);
+  }
+
+  Stmt VisitStmt_(const SBlockNode *op) final {
+    bool cube = op->name_hint == "CUBE";
+    bool vector = op->name_hint == "VECTOR";
+    if (!cube && !vector)
+      return StmtMutator::VisitStmt_(op);
+    ICHECK(!inside_region_)
+        << "PTO does not support nested T.Cube/T.Vector regions; "
+           "write sibling regions inside the kernel or its loop/condition.";
+    if (vector != vector_)
+      return Evaluate(0);
+    inside_region_ = true;
+    SBlock result = Downcast<SBlock>(StmtMutator::VisitStmt_(op));
+    inside_region_ = false;
+    // Keep the original lexical block and Vector(1) guard. Only its physical
+    // section role moves to the outer per-core wrapper.
+    result.CopyOnWrite()->name_hint =
+        vector ? "PTO_VECTOR_REGION" : "PTO_CUBE_REGION";
+    return result;
+  }
+
+  bool vector_;
+  bool inside_region_{false};
+};
+
 void CodeGenTileLangPTO::ResetRngState_() {
   pto_rng_state_var_.clear();
   pto_rng_counter_var_.clear();
@@ -2163,7 +2249,8 @@ void CodeGenTileLangPTO::ResetFunctionState_() {
 }
 
 void CodeGenTileLangPTO::AddFunction(const GlobalVar &gvar,
-                                     const PrimFunc &func) {
+                                     const PrimFunc &input_func) {
+  PrimFunc func = PTOMixedRegionProjector::Normalize(input_func);
   RegisterFunction_(gvar, func);
   current_function_name_ = GetFunctionName_(gvar);
   InitFuncState_(func);
@@ -8293,9 +8380,13 @@ void CodeGenTileLangPTO::VisitStmt_(const WhileNode *op) {
 }
 
 void CodeGenTileLangPTO::VisitStmt_(const SBlockNode *op) {
+  bool logical_region = op->name_hint == "PTO_CUBE_REGION" ||
+                        op->name_hint == "PTO_VECTOR_REGION";
   if (current_function_is_mixed_ &&
-      (op->name_hint == "CUBE" || op->name_hint == "VECTOR")) {
-    bool is_vector_section = op->name_hint == "VECTOR";
+      (logical_region || op->name_hint == "CUBE" ||
+       op->name_hint == "VECTOR")) {
+    bool is_vector_section =
+        op->name_hint == "VECTOR" || op->name_hint == "PTO_VECTOR_REGION";
     int64_t vector_count = 2;
     if (is_vector_section) {
       if (auto opt = op->annotations.Get("vector_count")) {
@@ -8310,17 +8401,22 @@ void CodeGenTileLangPTO::VisitStmt_(const SBlockNode *op) {
     // Physical sections are independent SSA regions.  Restore all captured
     // outer local.var bindings both before and after a section so neither a
     // sibling section nor ordinary outer code can observe section-local SSA.
-    RestoreMixedSectionVariables(op);
-    PrintIndent();
-    stream << "with tl.mixed_kernel_section(\""
-           << (is_vector_section ? "vector" : "cube") << "\"):\n";
-    int section_scope = BeginScope();
+    int section_scope = -1;
+    if (!logical_region) {
+      RestoreMixedSectionVariables(op);
+      PrintIndent();
+      stream << "with tl.mixed_kernel_section(\""
+             << (is_vector_section ? "vector" : "cube") << "\"):\n";
+      section_scope = BeginScope();
+    }
     bool old_in_mixed_vector_section = in_mixed_vector_section_;
     bool old_inside_mixed_section = inside_mixed_section_;
     in_mixed_vector_section_ = is_vector_section;
     inside_mixed_section_ = true;
-    PrintIndent();
-    stream << "pto.init_core()\n";
+    if (!logical_region) {
+      PrintIndent();
+      stream << "pto.init_core()\n";
+    }
     int active_aiv_scope = -1;
     if (is_vector_section && vector_count == 1) {
       // The physical mixed group still has two AIVs; only AIV0 executes this
@@ -8338,8 +8434,10 @@ void CodeGenTileLangPTO::VisitStmt_(const SBlockNode *op) {
     }
     inside_mixed_section_ = old_inside_mixed_section;
     in_mixed_vector_section_ = old_in_mixed_vector_section;
-    EndScope(section_scope);
-    RestoreMixedSectionVariables(op);
+    if (!logical_region) {
+      EndScope(section_scope);
+      RestoreMixedSectionVariables(op);
+    }
     return;
   }
 
